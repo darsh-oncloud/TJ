@@ -189,7 +189,7 @@ function (runtime, https, record, search, log) {
         safeSet(ifRec, 'custbody_total_qty_shipped', String(getTotalJazzQty(shipment)));
 
         // Shopify order number field on IF
-        safeSet(ifRec, SHOPIFY_ORDER_FIELD, shipment.po_number || '');
+       // safeSet(ifRec, SHOPIFY_ORDER_FIELD, shipment.po_number || '');
 
         setShipDates(ifRec, shipment.ship_date);
         setShipMethodFromJazzCode(ifRec, shipment.ship_code);
@@ -285,19 +285,42 @@ function (runtime, https, record, search, log) {
         return '';
     }
 
-    function setShipDates(ifRec, shipDate) {
-        if (!shipDate) return;
+    // function setShipDates(ifRec, shipDate) {
+    //     if (!shipDate) return;
 
-        try {
-            var d = new Date(shipDate + 'T00:00:00Z');
+    //     try {
+    //         var d = new Date(shipDate + 'T00:00:00Z');
 
-            safeSet(ifRec, 'trandate', d);
-            safeSet(ifRec, 'pickeddate', d);
-            safeSet(ifRec, 'packeddate', d);
-            safeSet(ifRec, 'shippeddate', d);
-        } catch (e) {}
+    //         safeSet(ifRec, 'trandate', d);
+    //         safeSet(ifRec, 'pickeddate', d);
+    //         safeSet(ifRec, 'packeddate', d);
+    //         safeSet(ifRec, 'shippeddate', d);
+    //     } catch (e) {}
+    // }
+function setShipDates(ifRec, shipDate) {
+    try {
+        // TESTING ONLY: using today's date because Jazz ship date may be in closed period.
+        // var d = new Date(shipDate + 'T00:00:00Z');
+
+        var d = new Date();
+
+        safeSet(ifRec, 'trandate', d);
+        safeSet(ifRec, 'pickeddate', d);
+        safeSet(ifRec, 'packeddate', d);
+        safeSet(ifRec, 'shippeddate', d);
+
+        log.audit('IF DATE SET FOR TESTING', {
+            originalJazzShipDate: shipDate,
+            dateUsed: d
+        });
+
+    } catch (e) {
+        log.error('SHIP DATE SET FAILED', getErr(e));
     }
+}
 
+
+  
     function setShipMethodFromJazzCode(ifRec, shipCode) {
         var data = getShipMethodInternalIdFromShipCode(shipCode);
 
