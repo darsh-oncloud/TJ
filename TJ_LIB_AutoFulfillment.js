@@ -10,6 +10,8 @@ function (runtime, https, record, search, log) {
     var SKU_FIELD = 'custcol_sku_external_id';
     var SHOPIFY_LINE_FIELD = 'custcol_shopify_line_item_id';
     var SHOPIFY_API_VERSION = '2026-01';
+
+    // Jazz cancel line-level fields on Sales Order item sublist
     var JAZZ_CANCELLED_SKU_LINE_FIELD = 'custcol_jazz_cancelled_sku_note';
     var JAZZ_CANCELLED_QTY_LINE_FIELD = 'custcol_jazz_cancelled_qty';
 
@@ -20,7 +22,6 @@ function (runtime, https, record, search, log) {
 
     function processSalesOrder(soId, wmsOrderNumber) {
         var ifId = '';
-        var shipment = null;
 
         try {
             log.audit('ORDER START', {
@@ -28,36 +29,64 @@ function (runtime, https, record, search, log) {
                 wmsOrderNumber: wmsOrderNumber
             });
 
-            shipment = getJazzShipment(wmsOrderNumber);
+            // New flow: check Jazz order status before checking shipment.
+            var orderStatus = '';
 
-            if (!shipment) {
-                log.audit('NO JAZZ SHIPMENT FOUND', {
-                    soId: soId,
-                    wmsOrderNumber: wmsOrderNumber
-                });
-                return;
-            }
-
-            var status = String(shipment.status || '').toLowerCase();
-
-            if (status !== 'confirmed' && status !== 'shipped') {
-                log.audit('JAZZ SHIPMENT NOT READY', {
+            try {
+                var orderStatusObj = getJazzOrderStatus(wmsOrderNumber);
+                orderStatus = getJazzOrderStatusText(orderStatusObj);
+            } catch (statusErr) {
+                log.error('JAZZ ORDER STATUS CHECK FAILED - USING OLD FLOW', {
                     soId: soId,
                     wmsOrderNumber: wmsOrderNumber,
-                    jazzStatus: shipment.status
+                    error: getErr(statusErr)
+                });
+            }
+
+            log.audit('JAZZ ORDER STATUS RESULT', {
+                soId: soId,
+                wmsOrderNumber: wmsOrderNumber,
+                orderStatus: orderStatus
+            });
+
+            // If Jazz order is still open, do nothing.
+            if (
+                orderStatus === 'NEW' ||
+                orderStatus === 'ALLOCATED' ||
+                orderStatus === 'PRINTED'
+            ) {
+                log.audit('JAZZ ORDER NOT READY - SKIPPING', {
+                    soId: soId,
+                    wmsOrderNumber: wmsOrderNumber,
+                    orderStatus: orderStatus
                 });
                 return;
             }
 
-            ifId = createItemFulfillmentFromJazz(soId, shipment);
+            // If full Jazz order is canceled, only update canceled lines on SO.
+            if (orderStatus === 'CANCELED' || orderStatus === 'CANCELLED') {
+                log.audit('JAZZ ORDER CANCELED - CHECKING CANCEL LINES', {
+                    soId: soId,
+                    wmsOrderNumber: wmsOrderNumber,
+                    orderStatus: orderStatus
+                });
 
-            log.audit('NETSUITE FULFILLMENT CREATED', {
-                soId: soId,
-                wmsOrderNumber: wmsOrderNumber,
-                ifId: ifId
-            });
+                updateSalesOrderWithJazzCancelledLines(soId, wmsOrderNumber);
+                return;
+            }
 
-            processShopifyFulfillment(ifId, soId, wmsOrderNumber);
+            // Closed order should not create fulfillment.
+            if (orderStatus === 'CLOSED') {
+                log.audit('JAZZ ORDER CLOSED - SKIPPING', {
+                    soId: soId,
+                    wmsOrderNumber: wmsOrderNumber,
+                    orderStatus: orderStatus
+                });
+                return;
+            }
+
+            // If shipped, or status is blank/unknown, continue with the old working flow.
+            ifId = processJazzShipmentAndShopify(soId, wmsOrderNumber);
 
         } catch (e) {
             var errMsg = getErr(e);
@@ -69,12 +98,112 @@ function (runtime, https, record, search, log) {
                 error: errMsg
             });
 
+            // Same old fallback: if Jazz shipped SKU does not match NetSuite IF lines,
+            // check Jazz cancel lines and update SO line note/quantity.
             if (
                 errMsg.indexOf('No SKU matched between Jazz shipment and NetSuite IF lines') !== -1
             ) {
                 updateSalesOrderWithJazzCancelledLines(soId, wmsOrderNumber);
             }
         }
+    }
+
+    function processJazzShipmentAndShopify(soId, wmsOrderNumber) {
+        var ifId = '';
+        var shipment = getJazzShipment(wmsOrderNumber);
+
+        if (!shipment) {
+            log.audit('NO JAZZ SHIPMENT FOUND - CHECKING CANCEL API', {
+                soId: soId,
+                wmsOrderNumber: wmsOrderNumber
+            });
+
+            updateSalesOrderWithJazzCancelledLines(soId, wmsOrderNumber);
+            return '';
+        }
+
+        var status = String(shipment.status || '').toLowerCase();
+
+        if (status !== 'confirmed' && status !== 'shipped') {
+            log.audit('JAZZ SHIPMENT NOT READY', {
+                soId: soId,
+                wmsOrderNumber: wmsOrderNumber,
+                jazzStatus: shipment.status
+            });
+            return '';
+        }
+
+        ifId = createItemFulfillmentFromJazz(soId, shipment);
+
+        log.audit('NETSUITE FULFILLMENT CREATED', {
+            soId: soId,
+            wmsOrderNumber: wmsOrderNumber,
+            ifId: ifId
+        });
+
+        processShopifyFulfillment(ifId, soId, wmsOrderNumber);
+
+        return ifId;
+    }
+
+    function getJazzOrderStatus(orderNumber) {
+        var domain = getParam('custscript_jazz_domain_if', '');
+        var tenant = getParam('custscript_jazz_tenant', 'TMJ');
+        var path = getParam(
+            'custscript_jazz_order_status_path_if',
+            '/api/v1/order/status?limit=10&order_number={order_number}'
+        );
+
+        var url = 'https://' + domain + path.replace('{order_number}', encodeURIComponent(orderNumber));
+
+        var response = https.get({
+            url: url,
+            headers: {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+                'Tenant': tenant,
+                'Authorization': 'Token ' + getJazzToken()
+            }
+        });
+
+        log.audit('JAZZ ORDER STATUS RESPONSE', {
+            orderNumber: orderNumber,
+            code: response.code
+        });
+
+        if (response.code === 404) return null;
+
+        if (Number(response.code) < 200 || Number(response.code) >= 300) {
+            throw new Error('Jazz Order Status GET failed HTTP ' + response.code + ' :: ' + response.body);
+        }
+
+        return selectBestJazzOrderStatus(JSON.parse(response.body || '{}'));
+    }
+
+    function selectBestJazzOrderStatus(obj) {
+        var arr = [];
+
+        if (Array.isArray(obj)) arr = obj;
+        else if (obj && Array.isArray(obj.results)) arr = obj.results;
+        else if (obj && Array.isArray(obj.data)) arr = obj.data;
+        else if (obj && Array.isArray(obj.orders)) arr = obj.orders;
+        else if (obj && obj.result && Array.isArray(obj.result)) arr = obj.result;
+        else if (obj && (obj.status || obj.order_status || obj.orderStatus)) return obj;
+
+        if (!arr.length) return null;
+
+        return arr[0];
+    }
+
+    function getJazzOrderStatusText(orderStatusObj) {
+        if (!orderStatusObj) return '';
+
+        return String(
+            orderStatusObj.status ||
+            orderStatusObj.order_status ||
+            orderStatusObj.orderStatus ||
+            ''
+        ).toUpperCase();
     }
 
     function getJazzShipment(orderNumber) {
@@ -296,28 +425,46 @@ function (runtime, https, record, search, log) {
         return '';
     }
 
-    function setShipDates(ifRec, shipDate) {
-        try {
-            // TESTING ONLY: using today's date because Jazz ship date may be in closed period.
-            // var d = new Date(shipDate + 'T00:00:00Z');
 
-            var d = new Date();
-
-            safeSet(ifRec, 'trandate', d);
-            safeSet(ifRec, 'pickeddate', d);
-            safeSet(ifRec, 'packeddate', d);
-            safeSet(ifRec, 'shippeddate', d);
-
-            log.audit('IF DATE SET FOR TESTING', {
-                originalJazzShipDate: shipDate,
-                dateUsed: d
+function setShipDates(ifRec, shipDate) {
+    try {
+        if (!shipDate) {
+            log.audit('NO JAZZ SHIP DATE FOUND - DATE NOT SET', {
+                shipDate: shipDate
             });
-
-        } catch (e) {
-            log.error('SHIP DATE SET FAILED', getErr(e));
+            return;
         }
+
+        var d = parseJazzDate(shipDate);
+
+        safeSet(ifRec, 'trandate', d);
+        safeSet(ifRec, 'pickeddate', d);
+        safeSet(ifRec, 'packeddate', d);
+        safeSet(ifRec, 'shippeddate', d);
+
+        log.audit('IF DATE SET FROM JAZZ SHIP DATE', {
+            jazzShipDate: shipDate,
+            dateUsed: d
+        });
+
+    } catch (e) {
+        log.error('SHIP DATE SET FAILED', getErr(e));
+    }
+}
+
+function parseJazzDate(dateStr) {
+    var parts = String(dateStr || '').split('-');
+
+    if (parts.length === 3) {
+        return new Date(
+            Number(parts[0]),
+            Number(parts[1]) - 1,
+            Number(parts[2])
+        );
     }
 
+    return new Date(dateStr);
+}
     function setShipMethodFromJazzCode(ifRec, shipCode) {
         var data = getShipMethodInternalIdFromShipCode(shipCode);
 
@@ -368,27 +515,45 @@ function (runtime, https, record, search, log) {
         }
     }
 
-    function addPackageLine(ifRec, shipment) {
-        var tracking = shipment.tracking_number || shipment.carton_number || '';
-        if (!tracking) return;
 
-        try {
-            var line = ifRec.getLineCount({ sublistId: 'package' });
+function addPackageLine(ifRec, shipment) {
+    var tracking = shipment.tracking_number || '';
+    var cartonNumber = shipment.carton_number || '';
 
-            ifRec.insertLine({
-                sublistId: 'package',
-                line: line
-            });
+    if (!tracking && !cartonNumber) return;
 
-            safeSetLine(ifRec, 'package', 'packagedescr', line, tracking);
+    try {
+        var line = ifRec.getLineCount({ sublistId: 'package' });
+
+        ifRec.insertLine({
+            sublistId: 'package',
+            line: line
+        });
+
+        // Package Contents Description = carton number
+        if (cartonNumber) {
+            safeSetLine(ifRec, 'package', 'packagedescr', line, cartonNumber);
+        }
+
+        // Package Tracking Number = tracking number
+        if (tracking) {
             safeSetLine(ifRec, 'package', 'packagetrackingnumber', line, tracking);
+        }
 
-            if (shipment.weight) {
-                safeSetLine(ifRec, 'package', 'packageweight', line, Number(shipment.weight || 0));
-            }
-        } catch (e) {}
+        if (shipment.weight) {
+            safeSetLine(ifRec, 'package', 'packageweight', line, Number(shipment.weight || 0));
+        }
+
+        log.audit('PACKAGE LINE ADDED', {
+            cartonNumber: cartonNumber,
+            trackingNumber: tracking,
+            weight: shipment.weight || ''
+        });
+
+    } catch (e) {
+        log.error('PACKAGE LINE ADD FAILED', getErr(e));
     }
-
+}
     function processShopifyFulfillment(ifId, soId, wmsOrderNumber) {
         try {
             var ifRec = record.load({
@@ -765,151 +930,188 @@ function (runtime, https, record, search, log) {
         });
     }
 
-    /**
-     * UPDATED FUNCTION
-     * Old logic updated body field.
-     * New logic loads SO, finds matching item line, and sets cancel note + cancel qty on line fields.
-     */
-    function updateSalesOrderWithJazzCancelledLines(soId, wmsOrderNumber) {
-        try {
-            var cancels = getJazzCancelTransactions(wmsOrderNumber);
 
-            if (!cancels || !cancels.length) {
-                log.audit('NO JAZZ CANCELLED LINES FOUND', {
-                    soId: soId,
-                    wmsOrderNumber: wmsOrderNumber
-                });
-                return;
-            }
+     function updateSalesOrderWithJazzCancelledLines(soId, wmsOrderNumber) {
+    try {
+        var cancels = getJazzCancelTransactions(wmsOrderNumber);
 
-            var cancelMap = buildJazzCancelMap(cancels);
-
-            if (!cancelMap || !hasObjectValue(cancelMap)) {
-                log.audit('NO VALID JAZZ CANCEL QTY FOUND', {
-                    soId: soId,
-                    wmsOrderNumber: wmsOrderNumber
-                });
-                return;
-            }
-
-            var soRec = record.load({
-                type: record.Type.SALES_ORDER,
-                id: soId,
-                isDynamic: false
+        if (!cancels || !cancels.length) {
+            log.audit('NO JAZZ CANCELLED LINES FOUND', {
+                soId: soId,
+                wmsOrderNumber: wmsOrderNumber
             });
+            return;
+        }
 
-            var lineCount = soRec.getLineCount({
-                sublistId: 'item'
+        var cancelLines = buildJazzCancelLineList(cancels);
+
+        if (!cancelLines || !cancelLines.length) {
+            log.audit('NO VALID JAZZ CANCEL QTY FOUND', {
+                soId: soId,
+                wmsOrderNumber: wmsOrderNumber
             });
+            return;
+        }
 
-            var updatedCount = 0;
-            var unmatchedSkus = [];
+        var soRec = record.load({
+            type: record.Type.SALES_ORDER,
+            id: soId,
+            isDynamic: true
+        });
 
-            for (var jazzSku in cancelMap) {
-                if (!cancelMap.hasOwnProperty(jazzSku)) {
-                    continue;
-                }
+        var soLineMap = buildSalesOrderCommittedLineMap(soRec);
+        var usedLinePointerMap = {};
 
-                var nsSku = convertJazzSkuToNetSuiteItemName(jazzSku);
-                var cancelQty = Number(cancelMap[jazzSku] || 0);
-                var matchedLine = -1;
+        var updatedCount = 0;
+        var unmatchedSkus = [];
 
-                for (var i = 0; i < lineCount; i++) {
-                    var soLineSku = getSalesOrderLineSku(soRec, i);
-                    var committedQty = getSalesOrderLineCommittedQty(soRec, i);
+        for (var c = 0; c < cancelLines.length; c++) {
+            var cancelObj = cancelLines[c];
 
-                    if (
-                        normalizeSku(soLineSku) === normalizeSku(nsSku) &&
-                        committedQty > 0
-                    ) {
-                        matchedLine = i;
-                        break;
-                    }
-                }
+            var matchedLine = getNextAvailableSalesOrderLine(
+                soLineMap,
+                usedLinePointerMap,
+                cancelObj.normalizedSku
+            );
 
-                if (matchedLine >= 0) {
-                    safeSetLine(
-                        soRec,
-                        'item',
-                        JAZZ_CANCELLED_SKU_LINE_FIELD,
-                        matchedLine,
-                        'Cancle SKU: ' + jazzSku
-                    );
-
-                    safeSetLine(
-                        soRec,
-                        'item',
-                        JAZZ_CANCELLED_QTY_LINE_FIELD,
-                        matchedLine,
-                        cancelQty
-                    );
-
-                    updatedCount++;
-
-                    log.audit('JAZZ CANCEL LINE UPDATED ON SO LINE', {
-                        soId: soId,
-                        wmsOrderNumber: wmsOrderNumber,
-                        jazzSku: jazzSku,
-                        netSuiteSku: nsSku,
-                        cancelQty: cancelQty,
-                        line: matchedLine
-                    });
-
-                } else {
-                    unmatchedSkus.push({
-                        jazzSku: jazzSku,
-                        netSuiteSku: nsSku,
-                        cancelQty: cancelQty
-                    });
-                }
-            }
-
-            if (updatedCount > 0) {
-                soRec.save({
-                    enableSourcing: false,
-                    ignoreMandatoryFields: true
+            if (matchedLine >= 0) {
+                soRec.selectLine({
+                    sublistId: 'item',
+                    line: matchedLine
                 });
-            }
 
-            if (unmatchedSkus.length) {
-                log.error('JAZZ CANCEL SKU NOT MATCHED ON SO LINE', {
+                safeSetCurrentLine(
+                    soRec,
+                    'item',
+                    JAZZ_CANCELLED_SKU_LINE_FIELD,
+                    'WMS Order: ' + wmsOrderNumber + '  Cancel SKU: ' + cancelObj.jazzSku + ', Cancel Qty: ' + cancelObj.cancelQty
+                );
+
+                safeSetCurrentLine(
+                    soRec,
+                    'item',
+                    JAZZ_CANCELLED_QTY_LINE_FIELD,
+                    Number(cancelObj.cancelQty)
+                );
+
+                soRec.commitLine({
+                    sublistId: 'item'
+                });
+
+                updatedCount++;
+
+                log.audit('JAZZ CANCEL LINE UPDATED ON SO LINE', {
                     soId: soId,
                     wmsOrderNumber: wmsOrderNumber,
-                    unmatchedSkus: unmatchedSkus
+                    jazzSku: cancelObj.jazzSku,
+                    netSuiteSku: cancelObj.netSuiteSku,
+                    cancelQty: cancelObj.cancelQty,
+                    jazzCancelLineNumber: cancelObj.lineNumber,
+                    line: matchedLine,
+                    uiLineNumber: matchedLine + 1
+                });
+
+            } else {
+                unmatchedSkus.push({
+                    jazzSku: cancelObj.jazzSku,
+                    netSuiteSku: cancelObj.netSuiteSku,
+                    cancelQty: cancelObj.cancelQty,
+                    jazzCancelLineNumber: cancelObj.lineNumber
                 });
             }
+        }
+
+        if (updatedCount > 0) {
+            var savedSoId = soRec.save({
+                enableSourcing: false,
+                ignoreMandatoryFields: true
+            });
 
             log.audit('JAZZ CANCELLED LINES UPDATE COMPLETE', {
-                soId: soId,
+                soId: savedSoId,
                 wmsOrderNumber: wmsOrderNumber,
                 updatedCount: updatedCount
             });
+        } else {
+            log.audit('NO SALES ORDER LINES UPDATED FOR JAZZ CANCEL', {
+                soId: soId,
+                wmsOrderNumber: wmsOrderNumber
+            });
+        }
 
-        } catch (e) {
-            log.error('UPDATE SO CANCELLED JAZZ LINES ERROR', {
+        if (unmatchedSkus.length) {
+            log.error('JAZZ CANCEL SKU NOT MATCHED ON SO LINE', {
                 soId: soId,
                 wmsOrderNumber: wmsOrderNumber,
-                error: getErr(e)
+                unmatchedSkus: unmatchedSkus
+            });
+        }
+
+    } catch (e) {
+        log.error('UPDATE SO CANCELLED JAZZ LINES ERROR', {
+            soId: soId,
+            wmsOrderNumber: wmsOrderNumber,
+            error: getErr(e)
+        });
+    }
+}
+
+
+function buildSalesOrderCommittedLineMap(soRec) {
+    var map = {};
+    var lineCount = soRec.getLineCount({
+        sublistId: 'item'
+    });
+
+    for (var i = 0; i < lineCount; i++) {
+        var soLineSku = getSalesOrderLineSku(soRec, i);
+        var committedQty = getSalesOrderLineCommittedQty(soRec, i);
+        var backorderedQty = getSalesOrderLineBackorderedQty(soRec, i);
+        var normalizedSku = normalizeSku(soLineSku);
+
+        if (
+            normalizedSku &&
+            (
+                committedQty > 0 ||
+                backorderedQty > 0
+            )
+        ) {
+            if (!map[normalizedSku]) {
+                map[normalizedSku] = [];
+            }
+
+            map[normalizedSku].push(i);
+        }
+    }
+
+    return map;
+}
+
+function buildJazzCancelLineList(cancels) {
+    var list = [];
+
+    for (var i = 0; i < cancels.length; i++) {
+        var cancelLine = cancels[i] || {};
+
+        var lineNumber = String(cancelLine.line_number || '');
+        var jazzSku = String(cancelLine.sku_code || '');
+        var cancelQty = Number(cancelLine.quantity || 0);
+
+        if (jazzSku && cancelQty > 0) {
+            var netSuiteSku = convertJazzSkuToNetSuiteItemName(jazzSku);
+
+            list.push({
+                lineNumber: lineNumber,
+                jazzSku: jazzSku,
+                netSuiteSku: netSuiteSku,
+                normalizedSku: normalizeSku(netSuiteSku),
+                cancelQty: cancelQty
             });
         }
     }
 
-    function buildJazzCancelMap(cancels) {
-        var map = {};
-
-        for (var i = 0; i < cancels.length; i++) {
-            var cancelLine = cancels[i] || {};
-
-            var sku = String(cancelLine.sku_code || '');
-            var qty = Number(cancelLine.quantity || 0);
-
-            if (sku && qty > 0) {
-                map[sku] = Number(map[sku] || 0) + qty;
-            }
-        }
-
-        return map;
-    }
+    return list;
+}
 
     function convertJazzSkuToNetSuiteItemName(jazzSku) {
         return String(jazzSku || '').split('_').join(':');
@@ -1081,6 +1283,26 @@ function (runtime, https, record, search, log) {
         } catch (e) {}
     }
 
+    function safeSetCurrentLine(rec, sublistId, fieldId, value) {
+        if (value === null || value === undefined || value === '') return;
+
+        try {
+            rec.setCurrentSublistValue({
+                sublistId: sublistId,
+                fieldId: fieldId,
+                value: value,
+                ignoreFieldChange: true
+            });
+        } catch (e) {
+            log.error('CURRENT LINE FIELD SET FAILED', {
+                sublistId: sublistId,
+                fieldId: fieldId,
+                value: value,
+                error: getErr(e)
+            });
+        }
+    }
+
     function getParam(id, defVal) {
         var val = runtime.getCurrentScript().getParameter({ name: id });
         return val === null || val === undefined || val === '' ? defVal : val;
@@ -1111,8 +1333,41 @@ function (runtime, https, record, search, log) {
         return text.length > 300 ? text.substring(0, 300) : text;
     }
 
+function getNextAvailableSalesOrderLine(soLineMap, usedLinePointerMap, normalizedSku) {
+    var lineList = soLineMap[normalizedSku] || [];
+
+    if (!lineList.length) {
+        return -1;
+    }
+
+    var pointer = Number(usedLinePointerMap[normalizedSku] || 0);
+
+    if (pointer >= lineList.length) {
+        return -1;
+    }
+
+    usedLinePointerMap[normalizedSku] = pointer + 1;
+
+    return lineList[pointer];
+}
+ function getSalesOrderLineBackorderedQty(soRec, line) {
+    var qty = 0;
+
+    try {
+        qty = Number(soRec.getSublistValue({
+            sublistId: 'item',
+            fieldId: 'quantitybackordered',
+            line: line
+        }) || 0);
+    } catch (e) {
+        qty = 0;
+    }
+
+    return qty;
+} 
     return {
         processSalesOrder: processSalesOrder,
-        getSearchValue: getSearchValue
+        getSearchValue: getSearchValue,
+        getJazzShipment: getJazzShipment 
     };
 });
